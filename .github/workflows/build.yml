@@ -1,0 +1,271 @@
+name: Build LanCam
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Prepare signing key
+        run: |
+          if [ ! -f lancam.jks ]; then
+            keytool -genkeypair -keystore lancam.jks -alias lancam -keyalg RSA -keysize 2048 -validity 36500 -storepass lancam123 -keypass lancam123 -dname "CN=LanCam"
+          fi
+
+      - name: Create Android shell project
+        run: flutter create --platforms=android --project-name lancam --org com.example _shell
+
+      - name: Copy sources
+        run: |
+          cp pubspec.yaml _shell/pubspec.yaml
+          cp -r lib/. _shell/lib/
+
+      - name: Patch Android config
+        run: |
+          python3 - <<'EOF'
+          import re, pathlib
+          m = pathlib.Path('_shell/android/app/src/main/AndroidManifest.xml')
+          t = m.read_text()
+          perms = ('<uses-permission android:name="android.permission.INTERNET"/>\n'
+                   '<uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>\n'
+                   '<uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>\n')
+          t = t.replace('<application', perms + '<application', 1)
+          t = t.replace('<application', '<application android:usesCleartextTraffic="true"', 1)
+          m.write_text(t)
+          for name in ['build.gradle.kts', 'build.gradle']:
+              g = pathlib.Path('_shell/android/app') / name
+              if g.exists():
+                  s = g.read_text()
+                  s = re.sub(r'minSdk(?:Version)?\s*=?\s*flutter\.minSdkVersion', 'minSdk = 24', s)
+                  g.write_text(s)
+          import os
+          ks = os.path.join(os.environ['GITHUB_WORKSPACE'], 'lancam.jks')
+          gk = pathlib.Path('_shell/android/app/build.gradle.kts')
+          if gk.exists():
+              s = gk.read_text()
+              block = ('android {\n    signingConfigs {\n        create("release") {\n'
+                       '            storeFile = file("' + ks + '")\n'
+                       '            storePassword = "lancam123"\n            keyAlias = "lancam"\n'
+                       '            keyPassword = "lancam123"\n        }\n    }\n')
+              s = re.sub(r'^android \{\n', lambda m: block, s, count=1, flags=re.M)
+              s = s.replace('signingConfigs.getByName("debug")', 'signingConfigs.getByName("release")')
+              gk.write_text(s)
+          EOF
+
+      - name: Build APK
+        working-directory: _shell
+        run: |
+          flutter pub get
+          flutter build apk --release --split-per-abi --build-number=${{ github.run_number }}
+
+      - name: Verify the phone APK (fails the build if it is not installable)
+        run: |
+          APK=_shell/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          ls -l "$APK"
+          unzip -tq "$APK"
+          "$BT/aapt2" dump badging "$APK" > badging.txt
+          grep -E "^package:|^sdkVersion|^targetSdkVersion|^launchable-activity|^native-code" badging.txt || true
+          grep -q "^package: name='com.example.lancam'" badging.txt || { echo "::error::Wrong package name"; exit 1; }
+          "$BT/apksigner" verify --print-certs "$APK" | tee cert.txt
+          grep -qi "2ad965d6359d69e6978f8e100f0fb7e9f177886fb4eb5ffccf01e96def28e76a" cert.txt || { echo "::error::Signed with the wrong key. Upload lancam.jks to the repository root."; exit 1; }
+          echo "APK verified OK"
+
+      - name: Publish phone APK to Releases (direct download, not zipped)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp _shell/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk LanCam-phone-arm64.apk
+          gh release create "phone-${{ github.run_number }}" LanCam-phone-arm64.apk --title "LanCam phone build ${{ github.run_number }}" --notes "Android phone APK (64-bit)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lancam-android-apk
+          path: _shell/build/app/outputs/flutter-apk/*.apk
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Create macOS shell project
+        run: flutter create --platforms=macos --project-name lancam --org com.example _shell
+
+      - name: Copy sources
+        run: |
+          cp pubspec.yaml _shell/pubspec.yaml
+          cp -r lib/. _shell/lib/
+
+      - name: Patch macOS config
+        run: |
+          python3 - <<'EOF'
+          import re, pathlib
+          for f in ['DebugProfile', 'Release']:
+              p = pathlib.Path(f'_shell/macos/Runner/{f}.entitlements')
+              t = p.read_text()
+              for k in ['com.apple.security.network.client', 'com.apple.security.network.server']:
+                  if k not in t:
+                      t = t.replace('<dict>', f'<dict>\n\t<key>{k}</key>\n\t<true/>', 1)
+              t = re.sub(r'(<key>com.apple.security.app-sandbox</key>\s*)<true/>', r'\1<false/>', t)
+              p.write_text(t)
+          p = pathlib.Path('_shell/macos/Runner/Info.plist')
+          t = p.read_text()
+          extra = ('\t<key>NSLocalNetworkUsageDescription</key>\n'
+                   '\t<string>Find and stream from IP cameras on your network.</string>\n'
+                   '\t<key>NSAppTransportSecurity</key>\n'
+                   '\t<dict><key>NSAllowsArbitraryLoads</key><true/></dict>\n')
+          i = t.rfind('</dict>')
+          p.write_text(t[:i] + extra + t[i:])
+          pf = pathlib.Path('_shell/macos/Podfile')
+          if pf.exists():
+              pf.write_text(re.sub(r"platform :osx, '[\d.]+'", "platform :osx, '11.0'", pf.read_text()))
+          px = pathlib.Path('_shell/macos/Runner.xcodeproj/project.pbxproj')
+          px.write_text(re.sub(r'MACOSX_DEPLOYMENT_TARGET = [\d.]+;', 'MACOSX_DEPLOYMENT_TARGET = 11.0;', px.read_text()))
+          EOF
+
+      - name: Build macOS app
+        working-directory: _shell
+        run: |
+          flutter pub get
+          flutter build macos --release
+          ditto -c -k --keepParent build/macos/Build/Products/Release/lancam.app lancam-macos.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lancam-macos-app
+          path: _shell/lancam-macos.zip
+
+  androidtv:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Prepare signing key
+        run: |
+          if [ ! -f lancam.jks ]; then
+            keytool -genkeypair -keystore lancam.jks -alias lancam -keyalg RSA -keysize 2048 -validity 36500 -storepass lancam123 -keypass lancam123 -dname "CN=LanCam"
+          fi
+
+      - name: Create Android TV shell project
+        run: flutter create --platforms=android --project-name lancam_tv --org com.example _shell
+
+      - name: Copy sources
+        run: |
+          cp pubspec.yaml _shell/pubspec.yaml
+          cp -r lib/. _shell/lib/
+
+      - name: Patch Android TV config
+        run: |
+          python3 - <<'EOF'
+          import re, pathlib, zlib, struct
+          m = pathlib.Path('_shell/android/app/src/main/AndroidManifest.xml')
+          t = m.read_text()
+          perms = ('<uses-permission android:name="android.permission.INTERNET"/>\n'
+                   '<uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>\n'
+                   '<uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>\n'
+                   '<uses-feature android:name="android.software.leanback" android:required="false"/>\n'
+                   '<uses-feature android:name="android.hardware.touchscreen" android:required="false"/>\n')
+          t = t.replace('<application', perms + '<application', 1)
+          t = t.replace('<application', '<application android:usesCleartextTraffic="true" android:banner="@drawable/banner"', 1)
+          t = t.replace('<category android:name="android.intent.category.LAUNCHER"/>',
+                        '<category android:name="android.intent.category.LAUNCHER"/>\n'
+                        '                <category android:name="android.intent.category.LEANBACK_LAUNCHER"/>', 1)
+          m.write_text(t)
+          for name in ['build.gradle.kts', 'build.gradle']:
+              g = pathlib.Path('_shell/android/app') / name
+              if g.exists():
+                  s = g.read_text()
+                  s = re.sub(r'minSdk(?:Version)?\s*=?\s*flutter\.minSdkVersion', 'minSdk = 24', s)
+                  g.write_text(s)
+          import os
+          ks = os.path.join(os.environ['GITHUB_WORKSPACE'], 'lancam.jks')
+          gk = pathlib.Path('_shell/android/app/build.gradle.kts')
+          if gk.exists():
+              s = gk.read_text()
+              block = ('android {\n    signingConfigs {\n        create("release") {\n'
+                       '            storeFile = file("' + ks + '")\n'
+                       '            storePassword = "lancam123"\n            keyAlias = "lancam"\n'
+                       '            keyPassword = "lancam123"\n        }\n    }\n')
+              s = re.sub(r'^android \{\n', lambda m: block, s, count=1, flags=re.M)
+              s = s.replace('signingConfigs.getByName("debug")', 'signingConfigs.getByName("release")')
+              gk.write_text(s)
+          # Home-screen banner (320x180 PNG) for the Google TV launcher
+          w, h = 320, 180
+          raw = b''
+          for y in range(h):
+              raw += b'\x00'
+              for x in range(w):
+                  inside = 110 <= x < 210 and 50 <= y < 130
+                  raw += bytes((76, 141, 246)) if inside else bytes((20, 24, 29))
+          def chunk(tag, data):
+              c = struct.pack('>I', len(data)) + tag + data
+              return c + struct.pack('>I', zlib.crc32(tag + data) & 0xffffffff)
+          png = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+                 + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+          d = pathlib.Path('_shell/android/app/src/main/res/drawable')
+          d.mkdir(parents=True, exist_ok=True)
+          (d / 'banner.png').write_bytes(png)
+          EOF
+
+      - name: Build TV APK (works on 32-bit and 64-bit TVs)
+        working-directory: _shell
+        run: |
+          flutter pub get
+          flutter build apk --release --dart-define=TV_MODE=true --build-number=${{ github.run_number }}
+
+      - name: Verify the TV APK (fails the build if it is not installable)
+        run: |
+          APK=_shell/build/app/outputs/flutter-apk/app-release.apk
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          ls -l "$APK"
+          unzip -tq "$APK"
+          "$BT/aapt2" dump badging "$APK" > badging.txt
+          grep -E "^package:|^sdkVersion|^targetSdkVersion|^launchable-activity|^leanback-launchable-activity|^native-code" badging.txt || true
+          grep -q "^package: name='com.example.lancam_tv'" badging.txt || { echo "::error::Wrong package name"; exit 1; }
+          grep -q "^leanback-launchable-activity" badging.txt || { echo "::error::APK is not marked as a TV app"; exit 1; }
+          "$BT/apksigner" verify --print-certs "$APK" | tee cert.txt
+          grep -qi "2ad965d6359d69e6978f8e100f0fb7e9f177886fb4eb5ffccf01e96def28e76a" cert.txt || { echo "::error::Signed with the wrong key. Upload lancam.jks to the repository root."; exit 1; }
+          echo "APK verified OK"
+
+      - name: Publish TV APK to Releases (direct download, not zipped)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp _shell/build/app/outputs/flutter-apk/app-release.apk LanCam-TV.apk
+          gh release create "tv-${{ github.run_number }}" LanCam-TV.apk --title "LanCam TV build ${{ github.run_number }}" --notes "Android TV / Google TV APK"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lancam-androidtv-apk
+          path: _shell/build/app/outputs/flutter-apk/app-release.apk
